@@ -1,6 +1,7 @@
 import argparse
 import calendar
 import os
+import re
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Any
@@ -55,7 +56,8 @@ def paginate(list_fn, **kwargs) -> list:
 # ── Data structures ─────────────────────────────────────────────────────────────
 
 @dataclass
-class ChargeRecord:
+class TransactionRecord:
+    type: str            # "charge" | "refund" | "dispute" | "dispute_reversal"
     product: str
     customer_email: str
     customer_name: str
@@ -64,15 +66,16 @@ class ChargeRecord:
     net: int            # cents
     payment_intent: str
     receipt_url: str
+    transaction_id: str
 
 
 class RevenueAccumulator:
-    """Tracks per-product revenue (integer cents) and detailed charge records."""
+    """Tracks per-product revenue (integer cents) and detailed transaction records."""
 
     def __init__(self):
         self._products: dict[str, Any] = {}
         self._revenue: dict[str, int] = {}
-        self.charge_records: dict[str, list[ChargeRecord]] = {}
+        self.transaction_records: dict[str, list[TransactionRecord]] = {}
 
     def add(self, product: Any, net_cents: int) -> None:
         assert isinstance(net_cents, int), (
@@ -88,8 +91,8 @@ class RevenueAccumulator:
         """Add a non-product line (e.g. fee, payout_minimum_balance_*)."""
         self.add({"id": label, "name": label}, net_cents)
 
-    def add_charge_record(self, product_name: str, record: ChargeRecord) -> None:
-        self.charge_records.setdefault(product_name, []).append(record)
+    def add_transaction_record(self, product_name: str, record: TransactionRecord) -> None:
+        self.transaction_records.setdefault(product_name, []).append(record)
 
     def entries(self) -> list[tuple[Any, int]]:
         return [(self._products[pid], rev) for pid, rev in self._revenue.items()]
@@ -134,26 +137,32 @@ def resolve_from_charge(client: StripeClient, charge) -> tuple[Any, str, str]:
     raise ValueError(f"Cannot resolve product for charge {charge.id}: no invoice or checkout session found")
 
 
-def resolve_from_refund(client: StripeClient, refund) -> Any:
-    """Return the product associated with a refund."""
+def resolve_from_refund(client: StripeClient, refund) -> tuple[Any, str, str, str, str]:
+    """Return (product, customer_email, customer_name, receipt_url, payment_intent) for a refund."""
     pi = client.payment_intent(refund.payment_intent)
 
     if getattr(pi, "payment_details", None) and pi.payment_details.order_reference.startswith("cs_"):
         session = stripe.checkout.Session.retrieve(pi.payment_details.order_reference)
-        return _checkout_product(client, session.id)
+        product = _checkout_product(client, session.id)
+        cd = session.customer_details
+        email, name = (cd.email or "" if cd else ""), (cd.name or "" if cd else "")
+    elif getattr(pi, "invoice", None):
+        product, invoice = _invoice_product(client, pi.invoice)
+        email, name = invoice.customer_email or "", invoice.customer_name or ""
+    else:
+        raise ValueError(f"Cannot resolve product for refund {refund.id}")
 
-    if getattr(pi, "invoice", None):
-        product, _ = _invoice_product(client, pi.invoice)
-        return product
-
-    raise ValueError(f"Cannot resolve product for refund {refund.id}")
+    charge = client.charge(refund.charge) if getattr(refund, "charge", None) else None
+    receipt_url = (getattr(charge, "receipt_url", "") or "") if charge else ""
+    return product, email, name, receipt_url, refund.payment_intent or ""
 
 
-def resolve_from_dispute(client: StripeClient, dispute) -> Any:
-    """Return the product associated with a dispute or dispute_reversal."""
+def resolve_from_dispute(client: StripeClient, dispute) -> tuple[Any, str, str, str, str]:
+    """Return (product, customer_email, customer_name, receipt_url, payment_intent) for a dispute or dispute_reversal."""
     charge = client.charge(dispute.charge)
-    product, _, _ = resolve_from_charge(client, charge)
-    return product
+    product, email, name = resolve_from_charge(client, charge)
+    receipt_url = getattr(charge, "receipt_url", "") or ""
+    return product, email, name, receipt_url, charge.payment_intent or ""
 
 
 # ── Transaction processing ──────────────────────────────────────────────────────
@@ -180,8 +189,20 @@ def process_transaction(t, client: StripeClient, acc: RevenueAccumulator) -> Non
 
     elif cat == "refund":
         assert t.source, f"refund transaction {t.id} has no source"
-        product = resolve_from_refund(client, client.refund(t.source))
+        product, email, name, receipt_url, pi_id = resolve_from_refund(client, client.refund(t.source))
         acc.add(product, t.net)
+        acc.add_transaction_record(product["name"], TransactionRecord(
+            type="refund",
+            product=product["name"],
+            customer_email=email,
+            customer_name=name,
+            amount=t.amount,
+            fee=t.fee,
+            net=t.net,
+            payment_intent=pi_id,
+            receipt_url=receipt_url,
+            transaction_id=t.id,
+        ))
 
     elif cat == "charge":
         assert t.source, f"charge transaction {t.id} has no source"
@@ -189,7 +210,8 @@ def process_transaction(t, client: StripeClient, acc: RevenueAccumulator) -> Non
         assert charge.payment_intent, f"charge {charge.id} has no payment_intent"
         product, email, name = resolve_from_charge(client, charge)
         acc.add(product, t.net)
-        acc.add_charge_record(product["name"], ChargeRecord(
+        acc.add_transaction_record(product["name"], TransactionRecord(
+            type="charge",
             product=product["name"],
             customer_email=email,
             customer_name=name,
@@ -198,14 +220,27 @@ def process_transaction(t, client: StripeClient, acc: RevenueAccumulator) -> Non
             net=t.net,
             payment_intent=charge.payment_intent,
             receipt_url=getattr(charge, "receipt_url", "") or "",
+            transaction_id=t.id,
         ))
 
     elif cat in ("dispute", "dispute_reversal"):
         # dispute: money debited when a dispute is opened against you
         # dispute_reversal: money returned when a dispute is won or closed
         assert t.source, f"{cat} transaction {t.id} has no source"
-        product = resolve_from_dispute(client, client.dispute(t.source))
+        product, email, name, receipt_url, pi_id = resolve_from_dispute(client, client.dispute(t.source))
         acc.add(product, t.net)
+        acc.add_transaction_record(product["name"], TransactionRecord(
+            type=cat,
+            product=product["name"],
+            customer_email=email,
+            customer_name=name,
+            amount=t.amount,
+            fee=t.fee,
+            net=t.net,
+            payment_intent=pi_id,
+            receipt_url=receipt_url,
+            transaction_id=t.id,
+        ))
 
     elif t.net != 0:
         raise RuntimeError(
@@ -309,28 +344,31 @@ def build_table(acc: RevenueAccumulator, year: int, month: int) -> PrettyTable:
     return table
 
 
-def _records_to_df(records: list[ChargeRecord]) -> pd.DataFrame:
+_UNSAFE_FILENAME_CHARS = re.compile(r'[\\/:*?"<>|\[\]]')
+
+
+def _safe_filename(name: str) -> str:
+    return _UNSAFE_FILENAME_CHARS.sub("_", name).strip()
+
+
+def _records_to_df(records: list[TransactionRecord]) -> pd.DataFrame:
     return pd.DataFrame([
-        {"product": r.product, "customer_email": r.customer_email, "customer_name": r.customer_name,
+        {"type": r.type, "product": r.product, "customer_email": r.customer_email, "customer_name": r.customer_name,
          "amount": r.amount, "fee": r.fee, "net": r.net,
-         "payment_intent": r.payment_intent, "receipt_url": r.receipt_url}
+         "payment_intent": r.payment_intent, "receipt_url": r.receipt_url, "transaction_id": r.transaction_id}
         for r in records
     ])
 
 
 def save_outputs(acc: RevenueAccumulator, table: PrettyTable, year: int, month: int) -> None:
-    prefix = f"{year}-{month}"
+    out_dir = os.path.join("reports", f"{year}-{month:02d}")
+    os.makedirs(out_dir, exist_ok=True)
 
-    with open(f"{prefix}.csv", "w", newline="", encoding="utf-8") as f:
-        f.write(table.get_csv_string())
-
-    for prod_name, records in acc.charge_records.items():
-        with pd.ExcelWriter(f"{prefix}-{prod_name}.xlsx") as w:
-            _records_to_df(records).to_excel(w, sheet_name=prod_name[:31], index=False)
-
-    with pd.ExcelWriter(f"{prefix}.xlsx") as w:
-        for prod_name, records in acc.charge_records.items():
-            _records_to_df(records).to_excel(w, sheet_name=prod_name[:31], index=False)
+    for prod_name, records in acc.transaction_records.items():
+        safe_name = _safe_filename(prod_name)
+        path = os.path.join(out_dir, f"{safe_name}.xlsx")
+        with pd.ExcelWriter(path) as w:
+            _records_to_df(records).to_excel(w, sheet_name=safe_name[:31], index=False)
 
 
 # ── Utilities ───────────────────────────────────────────────────────────────────

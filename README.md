@@ -75,11 +75,12 @@ For a run against month `YYYY-M`, the script writes:
 | File | Contents |
 |---|---|
 | Terminal | Reconciliation log + revenue table |
-| `YYYY-M.csv` | Revenue table as CSV |
-| `YYYY-M.xlsx` | All products in one workbook, one sheet each |
-| `YYYY-M-{Product}.xlsx` | One workbook per product with charge-level detail |
+| `reports/YYYY-MM/{Product}.xlsx` | One workbook per product with transaction-level detail |
 
-Each per-product sheet contains: customer email, customer name, amount, Stripe fee, net, payment intent ID, and receipt URL.
+Each per-product sheet contains one row per charge, refund, and dispute/dispute_reversal attributed to
+that product: transaction type, customer email, customer name, amount, Stripe fee, net, payment intent ID,
+receipt URL, and balance transaction ID. Refunds and disputes are recorded with negative amounts, so summing
+a sheet's `net` column reproduces that product's `Revenue ($)` in the terminal table exactly.
 
 ---
 
