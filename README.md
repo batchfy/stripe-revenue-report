@@ -75,7 +75,7 @@ For a run against month `YYYY-M`, the script writes:
 | File | Contents |
 |---|---|
 | Terminal | Reconciliation log + revenue table |
-| `reports/YYYY-MM/{Product}.xlsx` | One workbook per product with transaction-level detail |
+| `reports/YYYY-MM/YYYY-MM-{Product}.xlsx` | One workbook per product with transaction-level detail |
 
 Each per-product sheet contains one row per charge, refund, and dispute/dispute_reversal attributed to
 that product: transaction type, customer email, customer name, amount, Stripe fee, net, payment intent ID,

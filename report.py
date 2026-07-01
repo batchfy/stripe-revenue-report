@@ -8,6 +8,8 @@ from typing import Any
 
 import pandas as pd
 import stripe
+from openpyxl.styles import Font
+from openpyxl.utils import get_column_letter
 from prettytable import PrettyTable
 
 from cache import StripeCache
@@ -351,24 +353,75 @@ def _safe_filename(name: str) -> str:
     return _UNSAFE_FILENAME_CHARS.sub("_", name).strip()
 
 
+def _mask_email(email: str) -> str:
+    if not email or "@" not in email:
+        return email
+    local, domain = email.split("@", 1)
+    masked_local = f"{local[0]}***{local[-1]}" if len(local) > 1 else f"{local}***"
+    return f"{masked_local}@{domain}"
+
+
 def _records_to_df(records: list[TransactionRecord]) -> pd.DataFrame:
     return pd.DataFrame([
-        {"type": r.type, "product": r.product, "customer_email": r.customer_email, "customer_name": r.customer_name,
+        {"type": r.type, "product": r.product, "customer_email": _mask_email(r.customer_email),
+         "customer_name": r.customer_name,
          "amount": r.amount, "fee": r.fee, "net": r.net,
          "payment_intent": r.payment_intent, "receipt_url": r.receipt_url, "transaction_id": r.transaction_id}
         for r in records
     ])
 
 
+_HYPERLINK_FONT = Font(color="0563C1", underline="single")
+
+
+def _linkify_column(worksheet, df: pd.DataFrame, column: str) -> None:
+    """Turn a column of plain URL strings into clickable Excel hyperlinks."""
+    if column not in df.columns:
+        return
+    col_idx = df.columns.get_loc(column) + 1  # openpyxl columns are 1-indexed
+    for row_idx, url in enumerate(df[column], start=2):  # row 1 is the header
+        if not url:
+            continue
+        cell = worksheet.cell(row=row_idx, column=col_idx)
+        cell.hyperlink = url
+        cell.font = _HYPERLINK_FONT
+
+
+_COLUMN_WIDTHS = {
+    "type": 12,
+    "product": 20,
+    "customer_email": 22,
+    "customer_name": 20,
+    "amount": 10,
+    "fee": 10,
+    "net": 10,
+    "payment_intent": 20,
+    "receipt_url": 60,
+    "transaction_id": 20,
+}
+_DEFAULT_COLUMN_WIDTH = 15
+
+
+def _set_column_widths(worksheet, df: pd.DataFrame) -> None:
+    for col_idx, col_name in enumerate(df.columns, start=1):
+        width = _COLUMN_WIDTHS.get(col_name, _DEFAULT_COLUMN_WIDTH)
+        worksheet.column_dimensions[get_column_letter(col_idx)].width = width
+
+
 def save_outputs(acc: RevenueAccumulator, table: PrettyTable, year: int, month: int) -> None:
-    out_dir = os.path.join("reports", f"{year}-{month:02d}")
+    month_str = f"{year}-{month:02d}"
+    out_dir = os.path.join("reports", month_str)
     os.makedirs(out_dir, exist_ok=True)
 
     for prod_name, records in acc.transaction_records.items():
         safe_name = _safe_filename(prod_name)
-        path = os.path.join(out_dir, f"{safe_name}.xlsx")
+        sheet_name = safe_name[:31]
+        path = os.path.join(out_dir, f"{month_str}-{safe_name}.xlsx")
         with pd.ExcelWriter(path) as w:
-            _records_to_df(records).to_excel(w, sheet_name=safe_name[:31], index=False)
+            df = _records_to_df(records)
+            df.to_excel(w, sheet_name=sheet_name, index=False)
+            _linkify_column(w.sheets[sheet_name], df, "receipt_url")
+            _set_column_widths(w.sheets[sheet_name], df)
 
 
 # ── Utilities ───────────────────────────────────────────────────────────────────
