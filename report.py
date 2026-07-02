@@ -437,6 +437,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--year",  type=int, default=datetime.now().year)
     parser.add_argument("--month", type=int, default=datetime.now().month)
     parser.add_argument("--debug", action="store_true")
+    parser.add_argument("--payout-only", action="store_true", help="Only count this month's payouts and exit")
     parser.add_argument("--delete-cache", metavar="KEY", help="Delete a cache entry by key and exit")
     return parser.parse_args()
 
@@ -463,6 +464,9 @@ def main() -> None:
         )
         total_amount = sum(p.amount for p in payouts)
         print(f"{len(payouts)} payout(s), total {total_amount / 100:.2f}")
+
+        if args.payout_only:
+            return
 
         # Fetch all transactions per payout and verify the raw sums immediately.
         payout_transactions: dict[str, list] = {}
