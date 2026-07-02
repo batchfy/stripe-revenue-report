@@ -75,7 +75,11 @@ For a run against month `YYYY-M`, the script writes:
 | File | Contents |
 |---|---|
 | Terminal | Reconciliation log + revenue table |
-| `reports/YYYY-MM/YYYY-MM-{Product}.xlsx` | One workbook per product with transaction-level detail |
+| `reports/{Account}/YYYY-MM/YYYY-MM_{Product}.xlsx` | One workbook per product with transaction-level detail |
+
+`{Account}` is resolved from the Stripe account tied to `STRIPE_SECRET_KEY` (dashboard display name,
+falling back to business profile name, then account email, then account ID) — so pointing the script
+at a different key's account keeps that account's reports separate automatically.
 
 Each per-product sheet contains one row per charge, refund, and dispute/dispute_reversal attributed to
 that product: transaction type, customer email, customer name, amount, Stripe fee, net, payment intent ID,
